@@ -43,6 +43,7 @@ import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
 import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
 import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 
 /* ---------- 基础 ---------- */
 const renderer = new THREE.WebGLRenderer({ antialias: true });
@@ -64,6 +65,11 @@ const roadX = z => 25 + 45 * Math.sin((z - 40) * 0.0118) * smooth(40, 120, z) + 
 const roadProfile = z => 50 * smooth(40, 520, z) - 40 * smooth(560, 1000, z);
 const beachH = (x, z) => 0.9 * (1 - Math.exp(-Math.max(z - shoreZ(x), -60) * 0.08));
 const roadH = (x, z) => beachH(x, z) + (z - shoreZ(x) > 40 ? roadProfile(z) : 0);
+// 公路中心线旁、横向偏移 off 的点
+const offPt = (z, off) => {
+  const m = (roadX(z + 1) - roadX(z - 1)) / 2, k = off / Math.hypot(1, m);
+  return new THREE.Vector3(roadX(z) + k, 0, z - k * m);
+};
 
 /* ---------- 三个时段的色调 ---------- */
 const c = (r, g, b) => new THREE.Color(r, g, b);
@@ -77,7 +83,8 @@ const PAL = {
 };
 
 const U = {
-  uTime: { value: 0 }, uMix: { value: 0 }, uDay: { value: 0 }, uWalkFade: { value: 1 },
+  uTime: { value: 0 }, uMix: { value: 0 }, uDay: { value: 0 }, uWalkFade: { value: 1 }, uLamp: { value: 0 },
+  uPalm: { value: Array.from({ length: 6 }, () => new THREE.Vector3(0, -999, 0)) },   // 近处的棕榈（投影子用）
   uWalk: { value: Array.from({ length: 8 }, () => new THREE.Vector4()) },   // 行人位置（投影子用）
   uCar: { value: Array.from({ length: 5 }, () => new THREE.Vector4(0, -999, 0, 1)) },   // 车的位置与朝向
   uHorizon: { value: PAL.sunset.horizon.clone() }, uMid: { value: PAL.sunset.mid.clone() },
@@ -88,7 +95,7 @@ const U = {
 
 /* ---------- 共用 GLSL ---------- */
 const COMMON = /* glsl */`
-  uniform float uTime, uMix, uDay;
+  uniform float uTime, uMix, uDay, uLamp;
   uniform vec3 uHorizon, uMid, uTop, uSunCol, uWater, uSunDir;
 
   float hash(vec2 p){ p = fract(p * vec2(123.34, 456.21)); p += dot(p, p + 45.32); return fract(p.x * p.y); }
@@ -114,6 +121,10 @@ const COMMON = /* glsl */`
     return 25.0 + 45.0 * sin((z - 40.0) * 0.0118) * smoothstep(40.0, 120.0, z) + 80.0 * smoothstep(500.0, 1060.0, z);
   }
   float roadProfile(float z){ return 50.0 * smoothstep(40.0, 520.0, z) - 40.0 * smoothstep(560.0, 1000.0, z); }
+  // 城区：一整片铺装的平地
+  float cityMask(vec2 p){
+    return smoothstep(960.0, 1000.0, p.y) * (1.0 - smoothstep(1400.0, 1440.0, p.y)) * (1.0 - smoothstep(600.0, 680.0, abs(p.x - 130.0)));
+  }
   // 沙滩高度：z 越大越靠近岸上
   float sandH(vec2 p){
     float shore = 2.0 + sin(p.x * 0.05) * 1.5 + sin(p.x * 0.013 + 1.7) * 2.0;
@@ -124,7 +135,7 @@ const COMMON = /* glsl */`
       vec2 q = p * vec2(0.0045, 0.008);
       float r = 1.0 - abs(2.0 * noise(q) - 1.0);
       float dn = (r * r * 52.0 + noise(q * 3.1 + 4.0) * 16.0 + noise(q * 9.0) * 3.0) * ramp;
-      float cw = 1.0 - smoothstep(20.0, 100.0, abs(p.x - roadX(p.y)));   // 公路两侧 20 米内整平
+      float cw = max(1.0 - smoothstep(20.0, 100.0, abs(p.x - roadX(p.y))), cityMask(p));   // 公路两侧 20 米内、以及整片城区，都整平
       h += mix(dn, roadProfile(p.y), cw);
     }
     return h;
@@ -134,6 +145,25 @@ const COMMON = /* glsl */`
     return mix(col, fc, 1.0 - exp(-dist * k));
   }
   vec3 applyFog(vec3 col, vec3 V, float dist){ return applyFogK(col, V, dist, 0.0022 * (1.0 - 0.5 * uDay)); }
+  // 路灯照在地面上的光斑：沿公路每 30 米一盏，沙漠段左右交替，进城后两侧都有
+  float lampPool(vec2 p){
+    float m = (roadX(p.y + 1.0) - roadX(p.y - 1.0)) * 0.5, hyp = sqrt(1.0 + m * m);
+    if (abs(p.x - roadX(p.y)) > 50.0 * hyp || p.y < 20.0) return 0.0;
+    float s = 0.0, k0 = floor((p.y - 90.0) / 30.0);
+    for (int j = 0; j < 2; j++) {
+      float k = k0 + float(j);
+      if (k < 0.0 || k > 40.0) continue;
+      float zk = 90.0 + 30.0 * k;
+      vec2 q = p - vec2(roadX(zk), zk);
+      float al = (q.x * m + q.y) / hyp, lt = (q.x - q.y * m) / hyp;
+      float dl = k > 29.5 ? abs(lt) - 3.4 : lt - (mod(k, 2.0) * 2.0 - 1.0) * 3.4;
+      s += 343.0 / pow(49.0 + al * al + dl * dl, 1.5);
+    }
+    vec2 a = p - vec2(roadX(60.0) - 8.2, 54.3);                            // 海边回车场的一盏孤灯
+    float b = length(p - vec2(roadX(1300.0), 1305.66)) - 8.6;                // 城市环岛的一圈灯
+    s += 343.0 / pow(49.0 + dot(a, a), 1.5) + 343.0 / pow(49.0 + b * b, 1.5);
+    return s / (1.0 + 0.35 * s);                                             // 几盏灯叠在一起时不至于过曝
+  }
 `;
 
 /* ---------- 天空 ---------- */
@@ -192,6 +222,7 @@ const sand = new THREE.Mesh(
       varying vec3 vWorld;
       uniform vec4 uWalk[8];
       uniform vec4 uCar[5];
+      uniform vec3 uPalm[6];
       uniform float uWalkFade;
       // 行人在沙滩上拉长的影子
       float walkShadow(vec2 p){
@@ -208,6 +239,23 @@ const sand = new THREE.Mesh(
           sh = max(sh, (1.0 - smoothstep(w.w * 0.5, w.w * 1.3 + t * 0.6, dd)) * (1.0 - t * 0.7) * step(0.01, w.z));
         }
         return sh * smoothstep(0.01, 0.05, uSunDir.y) * uWalkFade;
+      }
+      // 棕榈树的影子：一条树干，末端一团被拉长的树冠
+      float palmShadow(vec2 p){
+        float sh = 0.0;
+        vec2 dir = -uSunDir.xz / max(uSunDir.y, 0.02);
+        for (int i = 0; i < 6; i++) {
+          vec2 d = dir * uPalm[i].z;
+          float len = max(length(d), 1e-3), cl = min(len, 30.0);
+          d *= cl / len;
+          vec2 pa = p - uPalm[i].xy;
+          float t = clamp(dot(pa, d) / max(dot(d, d), 1e-6), 0.0, 1.0);
+          float trunk = (1.0 - smoothstep(0.12, 0.4 + t * 0.5, length(pa - d * t))) * (1.0 - t * 0.5);
+          vec2 e = pa - d, dn = d / cl;
+          float crown = 1.0 - smoothstep(0.5, 1.0, length(vec2(dot(e, dn) / (2.5 + cl * 0.25), dot(e, vec2(-dn.y, dn.x)) / 3.2)));
+          sh = max(sh, max(trunk, crown * 0.75) * step(0.01, uPalm[i].z));
+        }
+        return sh * smoothstep(0.01, 0.05, uSunDir.y);
       }
       // 沙面细微起伏：每一层细节在小于一个像素时自动淡出，远处不会出现条纹
       float bump(vec2 p, float fp){
@@ -242,19 +290,40 @@ const sand = new THREE.Mesh(
         // 公路：直接画在地形上，边缘被沙子侵蚀
         float rz = p.y;
         float rm = (roadX(rz + 1.0) - roadX(rz - 1.0)) * 0.5;
-        float dr = abs(p.x - roadX(rz)) / sqrt(1.0 + rm * rm);
-        float edge = 4.2 + (noise(p * 0.3) - 0.5) * 1.2;
+        float lat = (p.x - roadX(rz)) / sqrt(1.0 + rm * rm), dr = abs(lat);
+        // 城区的铺装地面，边缘被沙子盖住一些
+        float cm = cityMask(p);
+        float cityP = cm > 0.0 ? smoothstep(0.4, 0.6, cm + (noise(p * 0.1) - 0.5) * 0.35) : 0.0;
+        float edge = 4.2 + (noise(p * 0.3) - 0.5) * 1.2 * (1.0 - cityP);
         float sdR = max(dr - edge, max(58.0 - rz, rz - 1302.0));
         sdR = min(sdR, length(p - vec2(roadX(60.0), 54.3)) - 4.8 - edge);        // 海边回车场
         sdR = min(sdR, length(p - vec2(roadX(1300.0), 1305.7)) - 9.0);           // 城市另一端
         float aa = fwidth(sdR) + 0.001;
         float road = 1.0 - smoothstep(-aa, aa, sdR);
-        float dryK = (1.0 - wet * 0.85) * (1.0 - road);
+        float dryK = (1.0 - wet * 0.85) * (1.0 - road) * (1.0 - cityP);
         N = normalize(N + vec3(-bg.x * 0.05, 0.0, -bg.y * 0.05 - rip * 0.05) * dryK);
         float nl = max(dot(N, uSunDir), 0.0);
         // 色差：大尺度斑驳 + 凹处略深
         vec3 alb = mix(vec3(0.80, 0.64, 0.46), vec3(0.70, 0.50, 0.36), fbm(p * 0.03))
                  * (0.93 + (fbm(p * 0.4) - 0.5) * 0.16 + (b0 - 0.5) * 0.25);
+        float fadeJ = clamp(1.0 - fp * 3.0, 0.0, 1.0), fadeZ = clamp(1.5 - fp * 2.5, 0.0, 1.0), xd = 99.0;
+        if (cityP > 0.001) {
+          xd = min(min(abs(rz - 1115.0), abs(rz - 1185.0)), abs(rz - 1255.0));                  // 到最近一条横街中线的距离
+          vec2 tg = abs(fract(p / 3.0) - 0.5);
+          vec3 g = vec3(0.30, 0.29, 0.28) * (0.83 + 0.22 * noise(p * 0.15) + 0.12 * noise(p * 0.02))
+                 * (1.0 - 0.3 * smoothstep(0.46, 0.5, max(tg.x, tg.y)) * fadeJ);                // 广场石板
+          vec2 sg = abs(fract(vec2(lat, rz) / 1.2) - 0.5);
+          vec3 sw = vec3(0.37, 0.335, 0.30) * (0.9 + 0.2 * noise(p * 0.6))
+                  * (1.0 - 0.3 * smoothstep(0.44, 0.5, max(sg.x, sg.y)) * fadeJ);               // 人行道地砖
+          float inSt = step(rz, 1300.0);
+          g = mix(g, sw, (1.0 - smoothstep(10.2, 10.6, dr)) * inSt);
+          g = mix(g, vec3(0.46, 0.45, 0.43), (1.0 - smoothstep(4.75, 4.85, dr)) * inSt);        // 路缘石
+          vec3 xa = vec3(0.08, 0.08, 0.09) * (0.8 + 0.4 * noise(p * 1.3));                      // 横街
+          xa = mix(xa, vec3(0.7), (1.0 - smoothstep(0.1, 0.1 + fp, xd)) * step(0.5, fract(p.x / 10.0)) * step(12.0, dr) * fadeZ);
+          xa = mix(xa, vec3(0.8), step(xd, 3.1) * step(5.4, dr) * step(dr, 9.2) * mix(0.5, step(0.5, fract(rz / 1.2)), fadeZ));   // 人行横道
+          g = mix(g, xa, 1.0 - smoothstep(3.5, 3.52 + fp, xd));
+          alb = mix(alb, g, cityP);
+        }
         if (road > 0.001) {
           vec3 asph = vec3(0.075, 0.075, 0.085) * (0.8 + 0.4 * noise(p * 1.3));
           float inStrip = step(62.0, rz) * step(rz, 1298.0);
@@ -262,12 +331,14 @@ const sand = new THREE.Mesh(
           float cl = (1.0 - smoothstep(0.11, 0.11 + aa, dr)) * step(0.5, fract(rz / 12.0));
           float el = 1.0 - smoothstep(0.07, 0.07 + aa, abs(dr - 3.5));
           asph = mix(asph, vec3(0.75, 0.62, 0.25), cl * lw * inStrip);
-          asph = mix(asph, vec3(0.7), el * lw * 0.8 * inStrip);
-          asph = mix(asph, alb * 0.75, smoothstep(0.55, 0.85, fbm(p * 0.07 + 3.0)) * 0.55);   // 路面浮沙
+          asph = mix(asph, vec3(0.7), el * lw * 0.8 * inStrip * step(3.6, xd));                 // 路口处边线断开
+          asph = mix(asph, vec3(0.8), step(5.5, xd) * step(xd, 8.5) * step(dr, 3.9) * cityP
+                                    * mix(0.5, step(0.5, fract(lat / 1.2 + 0.25)), fadeZ));     // 路口前的斑马线
+          asph = mix(asph, alb * 0.75, smoothstep(0.55, 0.85, fbm(p * 0.07 + 3.0)) * 0.55 * (1.0 - cityP));   // 路面浮沙（城里扫得干净）
           alb = mix(alb, asph, road);
         }
         // 影子：行人（长影）与汽车（车底）
-        float ws = p.y < 45.0 ? walkShadow(p) : 0.0;
+        float ws = max(p.y < 45.0 ? walkShadow(p) : 0.0, (p.y < 110.0 && abs(p.x - 8.0) < 40.0) ? palmShadow(p) : 0.0);
         float cs = 0.0;
         if (road > 0.001) for (int i = 0; i < 5; i++) cs = max(cs, 1.0 - smoothstep(1.3, 3.6, length(p - uCar[i].xy)));
         vec3 amb = (uMid * 0.30 + uTop * 0.25 + uHorizon * 0.30) * (1.0 - 0.1 * ws - 0.35 * cs);
@@ -280,7 +351,10 @@ const sand = new THREE.Mesh(
             float al = max(along, 0.0);
             hl += smoothstep(1.5, 5.0, along) * exp(-al * 0.045) * exp(-side * side / (4.0 + al * 0.9));
           }
-          dry += alb * vec3(1.0, 0.88, 0.65) * hl * 2.2 * (1.0 - uDay) * (0.12 + 0.88 * uMix);
+          dry += alb * vec3(1.0, 0.88, 0.65) * hl * 1.6 * (1.0 - uDay) * (0.12 + 0.88 * uMix);
+          dry += alb * vec3(1.0, 0.76, 0.45) * lampPool(p) * 1.3 * uLamp;                       // 路灯
+          dry += alb * vec3(1.0, 0.72, 0.42) * cityP * smoothstep(4.5, 9.5, dr) * (1.0 - smoothstep(10.0, 14.0, dr))
+               * smoothstep(5.0, 9.0, xd) * step(rz, 1296.0) * 0.3 * uLamp;                     // 橱窗映在人行道上的暖光
         }
         // 湿沙倒映天空
         vec3 R = reflect(-V, normalize(N + vec3(0.0, 2.0, 0.0)));
@@ -355,19 +429,41 @@ for (let row = 0; row < 3; row++) {
     const w = 13 + rnd() * 9, d = 13 + rnd() * 9;
     const b = { x: 120 + dx, z: 1080 + row * 70 + (rnd() - 0.5) * 20, rot: (rnd() - 0.5) * 1.2,
                 tone: 0.7 + rnd() * 0.6, haze: row * 0.12, glint: rnd() < 0.22 ? 1 : 0, sd: rnd() * 0.9 };
-    if (Math.abs(b.x - roadX(b.z)) < 22) continue;   // 给公路让出一条街
-    if (h > 170 && rnd() < 0.45) {                 // 退台式高楼
+    const off = Math.abs(b.x - roadX(b.z));
+    if (off < 22) continue;
+    const stepped = h > 170 && rnd() < 0.45;
+    if (off < 40) continue;                        // 给林荫道和沿街小楼让出地方
+    if (stepped) {                                 // 退台式高楼
       parts.push({ ...b, y: -10, w, h: h * 0.62 + 10, d });
       parts.push({ ...b, y: -10, w: w * 0.66, h: h + 10, d: d * 0.66 });
       if (h > 340) parts.push({ ...b, y: h, w: 1.8, h: 55, d: 1.8 });   // 尖顶
     } else parts.push({ ...b, y: -10, w, h: h + 10, d });
   }
 }
+// 林荫道两侧的小楼：一楼是店铺，横街处留出路口
+for (const side of [-1, 1]) for (const [z0, z1] of [[1060, 1108], [1122, 1178], [1192, 1248], [1262, 1294]]) {
+  for (let z = z0; z1 - z >= 9;) {
+    const w = [9, 13.5, 18].filter(v => v <= z1 - z)[Math.floor(rnd() * 3)] ?? 9, d = rnd() < 0.5 ? 9 : 13.5;
+    const zc = z + w / 2, m = (roadX(zc + 1) - roadX(zc - 1)) / 2, pt = offPt(zc, side * (10.5 + d / 2));
+    parts.push({ x: pt.x, z: pt.z, y: roadH(pt.x, pt.z), w: d, h: 8.4 + 3.4 * Math.floor(rnd() * 3), d: w, rot: Math.atan(m),
+                 tone: 0.8 + rnd() * 0.4, haze: -1, glint: 0, sd: rnd() * 0.9 });   // haze = -1 表示沿街小楼
+    z += w;
+  }
+}
+// 林荫道尽头的地标塔，和它两旁的几栋楼
+{
+  const x = roadX(1300), b = { x, z: 1376, rot: 0, tone: 1.05, haze: 0.3, glint: 1, sd: 0.37 };
+  parts.push({ ...b, y: -10, w: 36, h: 150, d: 30 }, { ...b, y: -10, w: 24, h: 290, d: 20 },
+             { ...b, y: -10, w: 13, h: 400, d: 12 }, { ...b, y: 390, w: 2, h: 80, d: 2 });
+  for (const dx of [-112, -74, -40, 40, 74, 112])
+    parts.push({ x: x + dx, z: 1352 + rnd() * 30, y: -10, w: 16 + rnd() * 8, h: 110 + rnd() * 130, d: 16 + rnd() * 8,
+                 rot: (rnd() - 0.5) * 0.6, tone: 0.7 + rnd() * 0.6, haze: 0.3, glint: 0, sd: rnd() * 0.9 });
+}
 const boxGeo = new THREE.BoxGeometry(1, 1, 1); boxGeo.translate(0, 0.5, 0);
 const city = new THREE.InstancedMesh(boxGeo, new THREE.ShaderMaterial({
   uniforms: U,
   vertexShader: /* glsl */`
-    varying vec3 vWorld, vN, vInst; varying float vFace, vTop, vY;
+    varying vec3 vWorld, vN, vInst; varying float vFace, vTop, vY, vHalf;
     void main(){
       vec4 w = modelMatrix * instanceMatrix * vec4(position, 1.0);
       vWorld = w.xyz;
@@ -375,11 +471,12 @@ const city = new THREE.InstancedMesh(boxGeo, new THREE.ShaderMaterial({
       vec3 sc = vec3(length(instanceMatrix[0].xyz), length(instanceMatrix[1].xyz), length(instanceMatrix[2].xyz));
       vec3 l = position * sc;
       vFace = abs(normal.x) > 0.5 ? l.z : l.x; vY = l.y; vTop = abs(normal.y);
+      vHalf = (abs(normal.x) > 0.5 ? sc.z : sc.x) * 0.5;
       vInst = instanceColor;
       gl_Position = projectionMatrix * viewMatrix * w;
     }`,
   fragmentShader: COMMON + /* glsl */`
-    varying vec3 vWorld, vN, vInst; varying float vFace, vTop, vY;
+    varying vec3 vWorld, vN, vInst; varying float vFace, vTop, vY, vHalf;
     void main(){
       vec3 toCam = cameraPosition - vWorld;
       float dist = length(toCam);
@@ -387,19 +484,53 @@ const city = new THREE.InstancedMesh(boxGeo, new THREE.ShaderMaterial({
       vec3 N = normalize(vN);
       float tone = vInst.r, glint = floor(vInst.b + 0.001), sd = fract(vInst.b);
       float ndl = max(dot(N, uSunDir), 0.0);
-      // 深色楼体：受光面略暖、背光面偏冷，每栋明暗不同
-      vec3 col = vec3(0.13, 0.13, 0.19) * tone * ((uMid * 0.4 + uTop * 0.6) * 1.2 + uSunCol * ndl * 1.2);
-      // 少数玻璃幕墙反射夕阳
-      col += uSunCol * pow(ndl, 6.0) * glint * 1.6 * (1.0 - uMix * 0.7)
-           * (0.6 + 0.4 * noise(vec2(vFace * 0.3, vY * 0.05) + sd * 50.0));
-      // 黄昏亮灯
-      vec2 wc = vec2(vFace / 3.2, vY / 4.5);
-      vec2 wf = abs(fract(wc) - 0.5);
-      float lit = step(0.6, hash(floor(wc) + sd * 100.0)) * step(wf.x, 0.36) * step(wf.y, 0.32) * (1.0 - vTop);
-      col += vec3(1.0, 0.66, 0.32) * lit * 1.3 * uMix;
-      // 远景雾 + 贴地的薄霭，后排更淡
+      float nearK = 1.0 - smoothstep(150.0, 500.0, dist);
+      vec3 col;
+      if (vInst.g < -0.5) {
+        // 沿街小楼：一楼是橱窗和遮阳棚，楼上住人
+        vec3 light = (uMid * 0.30 + uTop * 0.25 + uHorizon * 0.30) * 0.8 + uSunCol * (ndl * 2.0 + max(uSunDir.y, 0.0) * 0.9);
+        vec3 wall = mix(vec3(0.66, 0.56, 0.45), vec3(0.52, 0.36, 0.29), fract(sd * 7.3)) * tone;
+        col = wall * light;
+        if (vTop < 0.5) {
+          float bay = (vFace + vHalf) / 4.5;
+          float id = hash(vec2(floor(bay), sd * 91.0));
+          float bx = abs(fract(bay) - 0.5);
+          if (vY < 3.3) {                                   // 橱窗
+            float glass = step(bx, 0.43) * step(0.4, vY);
+            vec3 inside = mix(vec3(1.0, 0.68, 0.36), vec3(1.0, 0.86, 0.66), id) * (0.4 + 0.6 * smoothstep(0.3, 3.2, vY))
+                        * (0.72 + 0.28 * noise(vec2(vFace * 0.9 + sd * 30.0, 2.0))) * (0.9 + 0.1 * step(0.5, fract(vY / 0.95 + id * 3.0)));
+            vec3 refl = skyColor(normalize(reflect(-V, N) + vec3(0.0, 0.3, 0.0)));
+            col = mix(col * 0.45, refl * 0.10 + inside * (0.10 + 0.75 * uLamp), glass);
+          } else if (vY < 4.4) {                            // 遮阳棚
+            vec3 aw = id < 0.25 ? vec3(0.62, 0.16, 0.12) : id < 0.5 ? vec3(0.10, 0.36, 0.36)
+                    : id < 0.75 ? vec3(0.78, 0.70, 0.56) : vec3(0.72, 0.48, 0.14);
+            col = aw * (0.82 + 0.18 * step(0.5, fract(vFace / 0.7))) * (light + vec3(1.0, 0.8, 0.55) * 0.35 * uLamp);
+          } else {                                          // 楼上的窗
+            vec2 wc = vec2((vFace + vHalf) / 2.25, (vY - 4.4) / 3.4);
+            vec2 wf = abs(fract(wc) - 0.5);
+            float win = step(wf.x, 0.27) * step(wf.y, 0.3);
+            col = mix(col, vec3(0.05, 0.06, 0.09) * light * 1.4, win);
+            col += vec3(1.0, 0.70, 0.38) * win * step(0.5, hash(floor(wc) + sd * 100.0)) * 0.75 * uMix;
+          }
+          col += wall * vec3(1.0, 0.76, 0.45) * uLamp * 0.3 * exp(-vY / 5.0);   // 路灯映在墙面上
+        }
+      } else {
+        // 深色楼体：受光面略暖、背光面偏冷，每栋明暗不同；白天走近了是灰蓝的玻璃幕墙
+        vec3 body = mix(vec3(0.13, 0.13, 0.19), vec3(0.26, 0.29, 0.34), uDay * nearK);
+        col = body * tone * ((uMid * 0.4 + uTop * 0.6) * 1.2 + uSunCol * ndl * 1.2);
+        // 少数玻璃幕墙反射夕阳
+        col += uSunCol * pow(ndl, 6.0) * glint * 1.6 * (1.0 - uMix * 0.7) * (1.0 - 0.6 * nearK)
+             * (0.6 + 0.4 * noise(vec2(vFace * 0.3, vY * 0.05) + sd * 50.0));
+        vec2 wc = vec2(vFace / 3.2, vY / 4.5);
+        vec2 wf = abs(fract(wc) - 0.5);
+        float win = step(wf.x, mix(0.36, 0.27, nearK)) * step(wf.y, mix(0.32, 0.25, nearK)) * (1.0 - vTop);
+        col *= 1.0 - 0.4 * win * nearK * (1.0 - uMix);                                               // 走近了能看出一格格的窗
+        col += vec3(1.0, 0.66, 0.32) * win * step(0.6, hash(floor(wc) + sd * 100.0)) * mix(1.3, 0.8, nearK) * uMix;   // 黄昏亮灯
+        col += body * vec3(1.0, 0.76, 0.45) * uLamp * 0.5 * exp(-max(vWorld.y - 11.0, 0.0) / 6.0) * nearK;   // 街灯映在楼脚
+      }
+      // 远景雾 + 贴地的薄霭，后排更淡（走近了就散开）
       float f = 1.0 - exp(-dist * 0.0010);
-      f = mix(f, 1.0, clamp(exp(-max(vWorld.y, 0.0) / 50.0) * 0.45 + vInst.g * 0.5, 0.0, 1.0));
+      f = mix(f, 1.0, clamp(exp(-max(vWorld.y, 0.0) / 50.0) * 0.45 + max(vInst.g, 0.0) * 0.5, 0.0, 1.0) * smoothstep(80.0, 600.0, dist));
       vec3 fc = skyColor(normalize(vec3(-V.x, 0.02, -V.z)));
       gl_FragColor = vec4(mix(col, fc, f), 1.0);
     }`,
@@ -427,8 +558,13 @@ function lit(color, fade = ONE, glow = 0) {
     vertexShader: /* glsl */`
       varying vec3 vWorld, vN;
       void main(){
-        vec4 w = modelMatrix * vec4(position, 1.0);
-        vWorld = w.xyz; vN = normalize(mat3(modelMatrix) * normal);
+        #ifdef USE_INSTANCING
+          mat4 mm = modelMatrix * instanceMatrix;
+        #else
+          mat4 mm = modelMatrix;
+        #endif
+        vec4 w = mm * vec4(position, 1.0);
+        vWorld = w.xyz; vN = normalize(mat3(mm) * normal);
         gl_Position = projectionMatrix * viewMatrix * w;
       }`,
     fragmentShader: COMMON + /* glsl */`
@@ -444,6 +580,7 @@ function lit(color, fade = ONE, glow = 0) {
         float rim = pow(1.0 - max(dot(N, V), 0.0), 3.0) * max(dot(-V, uSunDir), 0.0);   // 逆光时的金边
         vec3 col = uColor * (amb + uSunCol * max(dot(N, uSunDir), 0.0) * 2.2 * sunUp) + uSunCol * rim * 0.9 * sunUp;
         col += uColor * uGlow * (1.0 - uDay);                                             // 车灯：日落后点亮
+        col += uColor * vec3(1.0, 0.76, 0.45) * lampPool(vWorld.xz) * uLamp * (0.7 + 0.3 * N.y) * 0.8;   // 走到路灯下会被照亮
         gl_FragColor = vec4(applyFog(col, V, dist), uFade);
       }`,
   }));
@@ -457,7 +594,7 @@ function limb(r, L, mat) {
   m.position.y = -L / 2; g.add(m); return g;
 }
 function makePerson(o) {
-  const M = col => lit(col, walkFade);
+  const M = col => lit(col, o.fade ?? walkFade);
   const top = M(o.top), bot = M(o.bottom ?? o.top), skin = M(o.skin ?? 0xd8a680), hair = M(o.hair ?? 0x2a1c14);
   const root = new THREE.Group(), body = new THREE.Group(); root.add(body);
   const put = (geo, mat, x, y, z, sx = 1, sy = 1, sz = 1) => {
@@ -593,10 +730,7 @@ function updateWalkers(dt, t, avoidCam) {
 /* ---------- 公路上的汽车 ---------- */
 // 行车路线：下行车道 → 海边回车场 → 上行车道 → 城市另一端掉头，首尾相接
 const ROAD_TOP = 1300, ROAD_BOT = 60, LANE = 2, BULB_R = 6, BULB_D = Math.sqrt(BULB_R ** 2 - LANE ** 2);
-const lanePt = (z, side) => {
-  const m = (roadX(z + 1) - roadX(z - 1)) / 2, k = side * LANE / Math.hypot(1, m);
-  return new THREE.Vector3(roadX(z) + k, 0, z - k * m);
-};
+const lanePt = (z, side) => offPt(z, side * LANE);
 const loopPts = [], th0 = Math.asin(LANE / BULB_R) + 0.3;
 for (let z = ROAD_TOP; z >= ROAD_BOT; z -= 8) loopPts.push(lanePt(z, 1));
 for (let th = th0; th <= 2 * Math.PI - th0; th += 0.3)
@@ -635,7 +769,7 @@ function updateCars(dt) {
   cars.forEach((car, i) => {
     const d = car.userData;
     loop.getPointAt(d.u, v3);
-    const slow = 0.3 + 0.7 * smooth(0, 80, Math.min(v3.z - 54, 1306 - v3.z));      // 掉头时减速
+    const slow = Math.max(0.3, (0.3 + 0.7 * smooth(0, 80, Math.min(v3.z - 54, 1306 - v3.z))) * (1 - 0.4 * smooth(1000, 1070, v3.z)));   // 掉头时减速，进城后慢行
     d.u = (d.u + 19 * slow * dt / LOOP_LEN) % 1;
     loop.getPointAt(d.u, v3); loop.getPointAt((d.u + 3.5 / LOOP_LEN) % 1, v4);
     car.position.set(v3.x, roadH(v3.x, v3.z) + 0.02, v3.z);
@@ -686,8 +820,218 @@ const motes = new THREE.Points(motesGeo, motesMat);
 motes.renderOrder = 4;
 scene.add(motes);
 
+/* ---------- 棕榈树 ---------- */
+const RBX = roadX(ROAD_TOP), RBZ = ROAD_TOP + BULB_D;            // 城市尽头环岛的圆心
+const TRUNK_H = 7.5;
+// 一片叶子：一条先上扬再下垂的带子，小叶的形状在着色器里切出来
+function frondGeo(L, e0, e1, az) {
+  const n = 7, W = 0.8, pos = [], uv = [], idx = [];
+  let x = 0.05, y = 0;
+  for (let i = 0; i <= n; i++) {
+    if (i) { const e = e0 + (e1 - e0) * Math.pow((i - 0.5) / n, 1.3); x += Math.cos(e) * L / n; y += Math.sin(e) * L / n; }
+    pos.push(x, y - 0.3 * W, -W, x, y, 0, x, y - 0.3 * W, W);
+    uv.push(i / n, -1, i / n, 0, i / n, 1);
+    if (i) { const a = i * 3 - 3, b = i * 3; idx.push(a, b, a + 1, a + 1, b, b + 1, a + 1, b + 1, a + 2, a + 2, b + 1, b + 2); }
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
+  g.setIndex(idx); g.computeVertexNormals();
+  return g.rotateY(az).translate(1, TRUNK_H, 0);
+}
+const palmGeo = (() => {
+  const trunk = new THREE.TubeGeometry(new THREE.CatmullRomCurve3([
+    new THREE.Vector3(0, -0.3, 0), new THREE.Vector3(0.22, 2.4, 0), new THREE.Vector3(0.68, 5.2, 0), new THREE.Vector3(1, TRUNK_H, 0),
+  ]), 10, 0.19, 7);
+  trunk.attributes.uv.array.fill(-1);                              // uv.x < 0 表示树干
+  const gs = [trunk];
+  for (let i = 0; i < 14; i++) {
+    const k = i / 13;                                              // 0 = 顶上的新叶，1 = 下垂的老叶
+    gs.push(frondGeo(3.3 + 1.2 * rnd(), 1.05 - 1.15 * k + (rnd() - 0.5) * 0.2, -0.9 - 0.5 * k, i * 2.4 + rnd() * 0.4));
+  }
+  return mergeGeometries(gs);
+})();
+const palmMat = new THREE.ShaderMaterial({
+  uniforms: U, side: THREE.DoubleSide,
+  vertexShader: COMMON + /* glsl */`
+    varying vec3 vWorld, vN; varying vec2 vUv;
+    void main(){
+      vUv = uv;
+      vec4 w = modelMatrix * instanceMatrix * vec4(position, 1.0);
+      // 随风轻摆：越高摆得越多，叶尖再多一点
+      float ph = uTime * 0.8 + instanceMatrix[3].x * 0.37 + instanceMatrix[3].z * 0.23;
+      float tip = max(uv.x, 0.0), sway = position.y * position.y * 0.003 + tip * 0.25;
+      w.x += sin(ph) * sway; w.z += cos(ph * 0.83) * sway * 0.6;
+      w.y += sin(ph * 1.9 + position.x * 2.0 + position.z * 2.0) * tip * 0.1;
+      vWorld = w.xyz; vN = normalize(mat3(instanceMatrix) * normal);
+      gl_Position = projectionMatrix * viewMatrix * w;
+    }`,
+  fragmentShader: COMMON + /* glsl */`
+    varying vec3 vWorld, vN; varying vec2 vUv;
+    void main(){
+      vec3 base;
+      float leaf = step(0.0, vUv.x);
+      if (leaf > 0.5) {                                            // 叶片：锯齿状地镂空，切出一条条小叶
+        float env = smoothstep(0.0, 0.1, vUv.x) * (1.0 - 0.8 * smoothstep(0.5, 1.0, vUv.x));
+        if (abs(vUv.y) > max(0.07, mix(0.18, 1.0, fract(vUv.x * 20.0)) * env)) discard;
+        base = mix(vec3(0.07, 0.15, 0.05), vec3(0.20, 0.27, 0.09), vUv.x);
+      } else base = vec3(0.27, 0.20, 0.15) * (0.75 + 0.25 * sin(vWorld.y * 10.0));
+      vec3 toCam = cameraPosition - vWorld;
+      float dist = length(toCam);
+      vec3 V = toCam / dist;
+      vec3 N = normalize(vN) * (gl_FrontFacing ? 1.0 : -1.0);
+      float sunUp = smoothstep(-0.02, 0.06, uSunDir.y);
+      vec3 amb = (uMid * 0.30 + uTop * 0.25 + uHorizon * 0.30) * (0.75 + 0.25 * N.y);
+      float back = pow(max(dot(-V, uSunDir), 0.0), 3.0) * leaf;                       // 逆光时叶子透亮
+      vec3 col = base * (amb + uSunCol * (max(dot(N, uSunDir), 0.0) * 2.2 + back * 1.6) * sunUp);
+      col += base * vec3(1.0, 0.76, 0.45) * lampPool(vWorld.xz) * uLamp * 1.6;        // 路灯从下面照上来
+      gl_FragColor = vec4(applyFog(col, V, dist), 1.0);
+    }`,
+});
+const palmSpots = [];
+const addPalm = (x, z, s, lean, rot = rnd() * 6.28) => palmSpots.push({ x, z, s, lean, rot });
+addPalm(-21, 12.5, 1.25, 0.26, Math.PI / 2 + 0.3);                 // 沙滩上三棵，朝海倾斜
+addPalm(-24.5, 15.5, 1.0, 0.15, Math.PI / 2 - 0.5);
+addPalm(-17.5, 17, 0.85, 0.2, Math.PI / 2 + 0.9);
+{
+  const bx = roadX(ROAD_BOT);                                      // 海边回车场旁三棵
+  addPalm(bx + 11.5, 49.5, 1.1, 0.1); addPalm(bx + 14, 55.5, 0.9, 0.04); addPalm(bx + 11, 61.5, 1.2, 0.08);
+  for (const z of [1005, 1035, 1065, 1095, 1125, 1155, 1215, 1245, 1275]) for (const sd of [-1, 1]) {   // 城里的林荫道
+    const pt = offPt(z, sd * 5.7); addPalm(pt.x, pt.z, 0.9 + rnd() * 0.25, 0.03);
+  }
+  for (let i = 0; i < 3; i++) {                                    // 环岛中央三棵，向外散开
+    const a = i * 2.094 + 0.5;
+    addPalm(RBX + 1.1 * Math.sin(a), RBZ + 1.1 * Math.cos(a), 1 + 0.18 * i, 0.12, Math.atan2(-Math.cos(a), Math.sin(a)));
+  }
+}
+const palms = new THREE.InstancedMesh(palmGeo, palmMat, palmSpots.length);
+{
+  const m = new THREE.Matrix4(), q = new THREE.Quaternion(), e = new THREE.Euler();
+  palmSpots.forEach((sp, i) => {
+    palms.setMatrixAt(i, m.compose(v3.set(sp.x, roadH(sp.x, sp.z), sp.z), q.setFromEuler(e.set(0, sp.rot, -sp.lean, 'YXZ')), v4.setScalar(sp.s)));
+    if (i < 6) U.uPalm.value[i].set(sp.x, sp.z, (TRUNK_H + 1.5) * sp.s);
+  });
+}
+palms.frustumCulled = false; scene.add(palms);
+
+/* ---------- 路灯 ---------- */
+const lampGeo = mergeGeometries([
+  new THREE.CylinderGeometry(0.07, 0.11, 7.2, 8).translate(0, 3.6, 0),      // 灯杆
+  new THREE.BoxGeometry(2.2, 0.08, 0.1).translate(1, 7.15, 0),              // 挑臂，伸向路面
+  new THREE.BoxGeometry(0.75, 0.12, 0.32).translate(2, 7.08, 0),            // 灯头
+]);
+const lampSpots = [];                                              // [x, z, 朝向]
+for (let k = 0; k <= 40; k++) {                                    // 位置要和着色器里的 lampPool 对上
+  const z = 90 + 30 * k, m = (roadX(z + 1) - roadX(z - 1)) / 2;
+  for (const sd of k > 29 ? [-1, 1] : [k % 2 * 2 - 1]) {
+    const pt = offPt(z, sd * 5.4);
+    lampSpots.push([pt.x, pt.z, Math.atan2(-sd * m, -sd)]);
+  }
+}
+lampSpots.push([roadX(ROAD_BOT) - 10.2, 54.3, 0]);                 // 海边回车场的一盏孤灯
+for (const a of [0, 2.094, -2.094]) lampSpots.push([RBX + 10.6 * Math.sin(a), RBZ + 10.6 * Math.cos(a), Math.atan2(Math.cos(a), -Math.sin(a))]);
+const lampMesh = new THREE.InstancedMesh(lampGeo, lit(0x2b2c33), lampSpots.length);
+const bulbMesh = new THREE.InstancedMesh(new THREE.BoxGeometry(0.6, 0.05, 0.24).translate(2, 7, 0), new THREE.ShaderMaterial({
+  uniforms: U,
+  vertexShader: `void main(){ gl_Position = projectionMatrix * viewMatrix * modelMatrix * instanceMatrix * vec4(position, 1.0); }`,
+  fragmentShader: `uniform float uLamp; void main(){ gl_FragColor = vec4(vec3(1.0, 0.8, 0.52) * (0.3 + 5.0 * smoothstep(0.0, 0.15, uLamp)), 1.0); }`,
+}), lampSpots.length);
+const haloPos = [];
+{
+  const m = new THREE.Matrix4(), q = new THREE.Quaternion(), up = new THREE.Vector3(0, 1, 0);
+  lampSpots.forEach(([x, z, rot], i) => {
+    const y = roadH(x, z);
+    m.compose(v3.set(x, y, z), q.setFromAxisAngle(up, rot), v4.setScalar(1));
+    lampMesh.setMatrixAt(i, m); bulbMesh.setMatrixAt(i, m);
+    haloPos.push(x + 2 * Math.cos(rot), y + 6.9, z - 2 * Math.sin(rot));
+  });
+}
+lampMesh.frustumCulled = bulbMesh.frustumCulled = false;
+scene.add(lampMesh, bulbMesh);
+// 灯头的光晕：远看是一串沿着公路爬上沙丘的光点
+const haloGeo = new THREE.BufferGeometry();
+haloGeo.setAttribute('position', new THREE.Float32BufferAttribute(haloPos, 3));
+const haloMat = new THREE.PointsMaterial({
+  size: 3.6, map: motesMat.map, color: 0xffb870, transparent: true, opacity: 0,
+  blending: THREE.AdditiveBlending, depthWrite: false,
+});
+const halo = new THREE.Points(haloGeo, haloMat);
+halo.renderOrder = 4; halo.frustumCulled = false; scene.add(halo);
+
+/* ---------- 环岛花坛、海边长椅 ---------- */
+{
+  const gy = roadH(RBX, RBZ);
+  const ring = new THREE.Mesh(new THREE.CylinderGeometry(2.9, 3.1, 0.5, 28), lit(0x9a9184)); ring.position.set(RBX, gy + 0.25, RBZ);
+  const lawn = new THREE.Mesh(new THREE.CylinderGeometry(2.6, 2.6, 0.56, 28), lit(0x3f5a2c)); lawn.position.set(RBX, gy + 0.28, RBZ);
+  scene.add(ring, lawn);
+  // 路灯下一张朝海的长椅
+  const bench = new THREE.Group(), wood = lit(0x6b4a32), iron = lit(0x25252a);
+  const bx = (w, h, d, x, y, z, mat) => { const b = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat); b.position.set(x, y, z); bench.add(b); return b; };
+  bx(1.8, 0.06, 0.5, 0, 0.46, 0, wood);                             // 座面
+  bx(1.8, 0.42, 0.05, 0, 0.82, 0.27, wood).rotation.x = 0.18;       // 靠背
+  for (const sx of [-0.78, 0.78]) { bx(0.06, 0.46, 0.46, sx, 0.23, 0, iron); bx(0.06, 0.5, 0.06, sx, 0.74, 0.26, iron); }
+  const bxp = roadX(ROAD_BOT) - 8.4;
+  bench.position.set(bxp, roadH(bxp, 50.4), 50.4);
+  scene.add(bench);
+}
+
+/* ---------- 城里人行道上的行人 ---------- */
+const cityRoot = new THREE.Group(); scene.add(cityRoot);
+const cityFolk = [
+  // 起点 z，路的哪一侧，离路中心多远，方向，步速，外形
+  [1075, 1, 7.3, 1, 1.3, { h: 1.80, top: 0x2f3b4c, bottom: 0x1f2126 }],
+  [1100, 1, 8.7, -1, 1.05, { h: 1.64, top: 0xc9503c, dress: true, skin: 0xe2b08c, longHair: true, shoe: 0x3a2a2a }],
+  [1140, 1, 7.2, -1, 0.95, { h: 1.66, top: 0x3f7f7a, bottom: 0xe6dccb, skin: 0xe2b08c, longHair: true }],
+  [1140.3, 1, 7.95, -1, 0.95, { h: 1.70, top: 0xefe6d6, bottom: 0x4a5a70, hair: 0x5a3a22, longHair: true }],
+  [1205, 1, 8.5, 1, 1.9, { h: 1.76, top: 0xe07a2f, bottom: 0x22252b, shorts: true }],
+  [1270, 1, 7.6, -1, 1.1, { h: 1.68, top: 0xf2efe8, dress: true, skin: 0xd9a47c, longHair: true, hair: 0x1c1512 }],
+  [1068, -1, 8.2, 1, 1.0, { h: 1.74, top: 0x8a8f96, bottom: 0x33363c, hair: 0xb8b4ae }],
+  [1130, -1, 7.3, 1, 0.85, { h: 1.72, top: 0x55657a, bottom: 0x2a2c33 }],
+  [1130.2, -1, 8.0, 1, 0.85, { h: 1.12, top: 0xe85d75, bottom: 0x4a6a8a, shorts: true, child: true }],
+  [1195, -1, 8.8, -1, 1.2, { h: 1.82, top: 0x5c6b3a, bottom: 0x2d2a26 }],
+  [1240, -1, 7.4, -1, 1.0, { h: 1.62, top: 0xe6b93c, dress: true, skin: 0xe2b08c, longHair: true }],
+  [1280, -1, 8.5, 1, 1.15, { h: 1.77, top: 0xf0eee8, bottom: 0x3a4658 }],
+].map(([z, side, lat, dir, speed, o]) => {
+  const P = makePerson({ ...o, fade: ONE });
+  cityRoot.add(P.root);
+  return { P, z, side, lat, dir, speed, phase: rnd() * 6 };
+});
+function updateCity(dt, t) {
+  cityRoot.visible = camera.position.z > 650;                       // 离得远就不用算了
+  if (!cityRoot.visible) return;
+  for (const w of cityFolk) {
+    w.z += w.dir * w.speed * dt;
+    if (w.z > 1292) w.dir = -1; else if (w.z < 1058) w.dir = 1;
+    w.phase += dt * w.speed * 4.3;
+    const m = (roadX(w.z + 1) - roadX(w.z - 1)) / 2, pt = offPt(w.z, w.side * w.lat), r = w.P.root;
+    let d = Math.atan2(w.dir * m, w.dir) - r.rotation.y;
+    d = Math.atan2(Math.sin(d), Math.cos(d));
+    r.rotation.y += d * Math.min(dt * 3, 1);                        // 掉头时慢慢转身
+    r.position.set(pt.x, roadH(pt.x, pt.z), pt.z);
+    pose(w.P, w.phase * w.P.cadence, 1, t);
+  }
+}
+
+/* ---------- 远处的帆船 ---------- */
+const boat = new THREE.Group();
+{
+  const hull = new THREE.Mesh(new THREE.CapsuleGeometry(0.85, 5.2, 3, 10), lit(0x2b2530));
+  hull.rotation.x = Math.PI / 2; hull.scale.set(1.3, 1, 0.6); hull.position.y = 0.2;
+  const mast = new THREE.Mesh(new THREE.CylinderGeometry(0.05, 0.07, 9.4, 6), lit(0x3a3030)); mast.position.set(0, 4.9, 0.4);
+  const tri = [[0, 1.5, 0.15], [0, 9.4, 0.25], [0, 1.5, -3.9], [0, 1.2, 0.7], [0, 8.3, 0.5], [0, 1.2, 3.6]];   // 主帆、前帆
+  const sailGeo = new THREE.BufferGeometry();
+  sailGeo.setAttribute('position', new THREE.Float32BufferAttribute([0, 1, 2, 2, 1, 0, 3, 4, 5, 5, 4, 3].flatMap(i => tri[i]), 3));   // 正反两面
+  sailGeo.computeVertexNormals();
+  const light = new THREE.Mesh(new THREE.SphereGeometry(0.12, 8, 6), lit(0xffd9a0, ONE, 5)); light.position.set(0, 9.7, 0.4);   // 桅顶灯
+  boat.add(hull, mast, new THREE.Mesh(sailGeo, lit(0xefe4d4)), light);
+  boat.rotation.y = Math.PI / 2; boat.position.set(-42, 0, -150);
+  scene.add(boat);
+}
+
 /* ---------- 后期 ---------- */
-const composer = new EffectComposer(renderer);
+// 用了 EffectComposer 之后 renderer 自带的抗锯齿不再生效，所以给后期缓冲区开 4 倍多重采样
+const composer = new EffectComposer(renderer, new THREE.WebGLRenderTarget(1, 1, { type: THREE.HalfFloatType, samples: 4 }));
+composer.setPixelRatio(renderer.getPixelRatio()); composer.setSize(innerWidth, innerHeight);
 composer.addPass(new RenderPass(scene, camera));
 const bloom = new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), PAL.sunset.bloom, 0.85, 0.88);
 composer.addPass(bloom);
@@ -750,6 +1094,7 @@ function applyView(v) {
   if (v === 1) { look.tYaw = Math.atan2(-povGroup.dir, 1.7); look.tPitch = 0; look.tFov = 62; }   // 顺着走的方向、偏向大海
   if (v === 2) { look.tYaw = 0; look.tPitch = -0.03; look.tFov = 64; }
   look.yaw = look.tYaw; look.pitch = look.tPitch; look.fov = look.tFov;
+  camera.fov = look.fov; camera.updateProjectionMatrix();
 }
 viewBtn.onclick = () => {
   if (viewMode === 0) freeLook = { yaw: look.tYaw, pitch: look.tPitch };
@@ -764,10 +1109,21 @@ addEventListener('resize', () => {
 });
 
 /* ---------- 循环 ---------- */
+let adaptive = true, fpsT = 0, fpsN = 0;
 const clock = new THREE.Clock();
 const qLook = new THREE.Quaternion(), eLook = new THREE.Euler();
 function frame() {
-  const dt = Math.min(clock.getDelta(), 0.05), t = clock.elapsedTime;
+  const rawDt = clock.getDelta(), dt = Math.min(rawDt, 0.05), t = clock.elapsedTime;
+  // 帧率连续 2.5 秒低于 30 就把渲染分辨率降一档（只降不升，免得来回跳）
+  if (rawDt > 0.5) fpsT = fpsN = 0;                             // 切到别的标签页再回来，不算卡顿
+  else if (adaptive && t > 4) {
+    fpsT += rawDt; fpsN++;
+    if (fpsT >= 2.5) {
+      const pr = renderer.getPixelRatio();
+      if (fpsN / fpsT < 30 && pr > 0.75) { const np = Math.max(0.75, pr * 0.8); renderer.setPixelRatio(np); composer.setPixelRatio(np); }
+      fpsT = fpsN = 0;
+    }
+  }
   U.uTime.value = t;
 
   // 时段过渡：白天(0) → 日落(1) → 黄昏(2)
@@ -784,7 +1140,9 @@ function frame() {
   renderer.toneMappingExposure = mixv(A.exp, B.exp);
   motesMat.opacity = mixv(A.motes, B.motes);
   walkFade.value = U.uWalkFade.value = smooth(0.3, 0.8, tod);   // 行人在傍晚出现
-  walkersRoot.visible = walkFade.value > 0.01;
+  walkersRoot.visible = walkFade.value > 0.01 && camera.position.z < 450;
+  const lampK = U.uLamp.value = smooth(0.75, 1.7, tod);         // 路灯：日落时刚亮起，入夜全亮
+  haloMat.opacity = 0.8 * smooth(0, 0.5, lampK); halo.visible = lampK > 0.004;
 
   water.position.y = 0.06 * Math.sin(t * 0.5);          // 潮水涨落
   motes.position.y = Math.sin(t * 0.2) * 0.3;
@@ -801,6 +1159,9 @@ function frame() {
 
   updateWalkers(dt, t, true);
   updateCars(dt);
+  updateCity(dt, t);
+  boat.position.x += dt * 0.55; if (boat.position.x > 150) boat.position.x = -150;      // 帆船慢慢横过海面
+  boat.position.y = 0.05 * Math.sin(t * 0.8); boat.rotation.z = 0.035 * Math.sin(t * 0.6);
 
   // 镜头
   if (viewMode === 0 && performance.now() - lastInput > 6000) look.tYaw += dt * 0.02;   // 闲置时缓慢环视
