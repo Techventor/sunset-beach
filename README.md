@@ -2,6 +2,8 @@
 
 一个用 Three.js 写成的单文件 3D 场景：夕阳下的海滩、身后蜿蜒穿过沙漠的公路，以及远处若隐若现的城市。
 
+**▶ 在线体验：https://techventor.github.io/sunset-beach/**
+
 ![日落时分的海滩](screenshots/sunset.png)
 
 | 黄昏 · 从海边回望公路与城市 | 黄昏 · 驾车驶入城市 |
