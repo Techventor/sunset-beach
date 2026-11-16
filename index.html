@@ -91,6 +91,7 @@ const U = {
   uTop: { value: PAL.sunset.top.clone() }, uSunCol: { value: PAL.sunset.sun.clone() },
   uWater: { value: PAL.sunset.water.clone() },
   uSunDir: { value: new THREE.Vector3(0, PAL.sunset.elev, -1).normalize() },
+  uScreen: { value: new THREE.Vector4(0, -999, 0, 0) },                     // 长椅上那台电脑的屏幕：位置与亮度
 };
 
 /* ---------- 共用 GLSL ---------- */
@@ -568,7 +569,7 @@ function lit(color, fade = ONE, glow = 0) {
         gl_Position = projectionMatrix * viewMatrix * w;
       }`,
     fragmentShader: COMMON + /* glsl */`
-      uniform vec3 uColor; uniform float uFade, uGlow;
+      uniform vec3 uColor; uniform float uFade, uGlow; uniform vec4 uScreen;
       varying vec3 vWorld, vN;
       void main(){
         vec3 toCam = cameraPosition - vWorld;
@@ -581,6 +582,8 @@ function lit(color, fade = ONE, glow = 0) {
         vec3 col = uColor * (amb + uSunCol * max(dot(N, uSunDir), 0.0) * 2.2 * sunUp) + uSunCol * rim * 0.9 * sunUp;
         col += uColor * uGlow * (1.0 - uDay);                                             // 车灯：日落后点亮
         col += uColor * vec3(1.0, 0.76, 0.45) * lampPool(vWorld.xz) * uLamp * (0.7 + 0.3 * N.y) * 0.8;   // 走到路灯下会被照亮
+        vec3 sl = uScreen.xyz - vWorld; float sq = dot(sl, sl);
+        col += uColor * vec3(0.55, 0.72, 1.0) * uScreen.w * max(dot(N, sl) / sqrt(sq), 0.0) / (1.0 + sq * 12.0);   // 电脑屏幕的冷光映在脸上
         gl_FragColor = vec4(applyFog(col, V, dist), uFade);
       }`,
   }));
@@ -604,8 +607,9 @@ function makePerson(o) {
   put(new THREE.SphereGeometry(0.16, 12, 8), o.dress ? top : bot, 0, 0.96, 0, 1.12, 0.8, 0.8);        // 髋
   put(new THREE.CylinderGeometry(0.045, 0.05, 0.1, 8), skin, 0, 1.5, 0);                              // 颈
   const hs = o.child ? 1.22 : 1, hy = (hs - 1) * 0.1;
-  put(new THREE.SphereGeometry(0.108, 14, 10), skin, 0, 1.63 + hy, 0.008, 0.92 * hs, 1.08 * hs, hs);  // 头
-  put(new THREE.SphereGeometry(0.116, 14, 10), hair, 0, 1.652 + hy, -0.022, 0.95 * hs, 1.05 * hs, hs);
+  const head = new THREE.Group(); head.position.y = 1.52; body.add(head);                              // 头单独成组，可以低头、抬头
+  head.add(put(new THREE.SphereGeometry(0.108, 14, 10), skin, 0, 0.11 + hy, 0.008, 0.92 * hs, 1.08 * hs, hs),
+           put(new THREE.SphereGeometry(0.116, 14, 10), hair, 0, 0.132 + hy, -0.022, 0.95 * hs, 1.05 * hs, hs));
   if (o.longHair) put(new THREE.CapsuleGeometry(0.085, 0.2, 3, 8), hair, 0, 1.45, -0.085, 1.25, 1, 0.55);
   if (o.dress) put(new THREE.CylinderGeometry(0.14, 0.29, 0.6, 14), top, 0, 0.7, 0);                  // 裙摆
   const legs = [-1, 1].map(sd => {
@@ -617,11 +621,12 @@ function makePerson(o) {
   });
   const arms = [-1, 1].map(sd => {
     const up = limb(0.048, 0.3, top); up.position.set(sd * 0.215, 1.43, 0); up.rotation.z = sd * 0.07;
-    const fore = limb(0.04, 0.29, skin); fore.position.y = -0.28; up.add(fore);
+    const fore = limb(o.sleeves ? 0.046 : 0.04, 0.29, o.sleeves ? top : skin); fore.position.y = -0.28; up.add(fore);
+    if (o.sleeves) { const hand = new THREE.Mesh(new THREE.SphereGeometry(0.043, 8, 6), skin); hand.position.y = -0.275; fore.add(hand); }   // 长袖：只露出手
     body.add(up); return { up, fore, locked: false };
   });
   root.scale.setScalar(o.h / 1.75);
-  return { root, body, legs, arms, h: o.h, cadence: 1.75 / o.h };
+  return { root, body, head, legs, arms, h: o.h, cadence: 1.75 / o.h };
 }
 // 行走姿态：ph 为步态相位，a 为步幅（0 = 站立）
 function pose(P, ph, a, t) {
@@ -959,13 +964,14 @@ const halo = new THREE.Points(haloGeo, haloMat);
 halo.renderOrder = 4; halo.frustumCulled = false; scene.add(halo);
 
 /* ---------- 环岛花坛、海边长椅 ---------- */
+const bench = new THREE.Group();
 {
   const gy = roadH(RBX, RBZ);
   const ring = new THREE.Mesh(new THREE.CylinderGeometry(2.9, 3.1, 0.5, 28), lit(0x9a9184)); ring.position.set(RBX, gy + 0.25, RBZ);
   const lawn = new THREE.Mesh(new THREE.CylinderGeometry(2.6, 2.6, 0.56, 28), lit(0x3f5a2c)); lawn.position.set(RBX, gy + 0.28, RBZ);
   scene.add(ring, lawn);
   // 路灯下一张朝海的长椅
-  const bench = new THREE.Group(), wood = lit(0x6b4a32), iron = lit(0x25252a);
+  const wood = lit(0x6b4a32), iron = lit(0x25252a);
   const bx = (w, h, d, x, y, z, mat) => { const b = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat); b.position.set(x, y, z); bench.add(b); return b; };
   bx(1.8, 0.06, 0.5, 0, 0.46, 0, wood);                             // 座面
   bx(1.8, 0.42, 0.05, 0, 0.82, 0.27, wood).rotation.x = 0.18;       // 靠背
@@ -973,6 +979,97 @@ halo.renderOrder = 4; halo.frustumCulled = false; scene.add(halo);
   const bxp = roadX(ROAD_BOT) - 8.4;
   bench.position.set(bxp, roadH(bxp, 50.4), 50.4);
   scene.add(bench);
+}
+
+/* ---------- 长椅上默默努力的人 ---------- */
+// 别人散步、看日落，这个人从白天到入夜一直坐在路灯下，戴着耳机，对着腿上的电脑埋头干活
+const striver = makePerson({ h: 1.72, top: 0xaeb3bd, bottom: 0x2c3442, hair: 0x1d1714, shoe: 0xe6e2da, sleeves: true, fade: ONE });
+const typed = { value: 3.4 };                                       // 屏幕上已经写了几行
+const HIP_Y = 0.6, SIT = 1.27;                                      // 坐姿：髋的高度、大腿前伸的角度
+const handSpot = [-1, 1].map(sd => new THREE.Vector3(sd * 0.075, 0.045, -0.015));   // 两只手在键盘上的落点
+{
+  const part = (parent, geo, mat, x, y, z, sx = 1, sy = 1, sz = 1) => {
+    const m = new THREE.Mesh(geo, mat); m.position.set(x, y, z); m.scale.set(sx, sy, sz); parent.add(m); return m;
+  };
+  const hoodie = lit(0xaeb3bd), cream = lit(0xe9e4da), alu = lit(0x9a9da3), teal = lit(0x2e6468);
+  part(striver.body, new THREE.SphereGeometry(0.11, 10, 8), hoodie, 0, 1.46, -0.1, 1.35, 0.7, 0.8);               // 帽衫的帽子搭在背后
+  part(striver.head, new THREE.TorusGeometry(0.13, 0.011, 6, 18, Math.PI), cream, 0, 0.125, -0.005);              // 头戴式耳机
+  for (const sd of [-1, 1]) part(striver.head, new THREE.CylinderGeometry(0.043, 0.043, 0.035, 12), cream, sd * 0.112, 0.105, 0).rotation.z = Math.PI / 2;
+
+  // 腿上的笔记本电脑：顺着大腿的坡度放着，屏幕朝向自己
+  const laptop = new THREE.Group(), lid = new THREE.Group();
+  laptop.position.set(0, 0.59, 0.31); laptop.rotation.x = 0.3;
+  part(laptop, new THREE.BoxGeometry(0.33, 0.016, 0.23), alu, 0, 0, 0);
+  part(laptop, new THREE.BoxGeometry(0.28, 0.003, 0.1), lit(0x2a2c31), 0, 0.008, 0.04);                           // 键盘
+  lid.position.set(0, 0.008, 0.115); lid.rotation.x = 0.38;
+  part(lid, new THREE.BoxGeometry(0.33, 0.215, 0.008), alu, 0, 0.1075, 0);
+  part(lid, new THREE.CylinderGeometry(0.022, 0.022, 0.003, 12), lit(0xe0703a), 0.09, 0.15, 0.005).rotation.x = Math.PI / 2;   // 盖子上的两张贴纸
+  part(lid, new THREE.BoxGeometry(0.05, 0.035, 0.003), teal, -0.08, 0.07, 0.005).rotation.z = 0.2;
+  const screen = part(lid, new THREE.PlaneGeometry(0.3, 0.185), new THREE.ShaderMaterial({
+    uniforms: { ...U, uTyped: typed },
+    vertexShader: `varying vec2 vUv; void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
+    fragmentShader: COMMON + /* glsl */`
+      uniform float uTyped; varying vec2 vUv;
+      void main(){
+        // 一页文档：一行行字随着敲键盘往下长，写满一页就翻到下一页
+        float rows = 13.0, y = (1.0 - vUv.y) * rows, row = floor(y);
+        float page = floor(uTyped / (rows - 3.0)), cur = uTyped - page * (rows - 3.0) + 1.0;
+        float len = 0.3 + 0.7 * hash(vec2(row, page) + 0.5);                                 // 每行长短不一
+        len *= row < floor(cur) ? 1.0 : (row == floor(cur) ? fract(cur) : 0.0);
+        float ink = step(0.09, vUv.x) * step(vUv.x, 0.09 + 0.82 * len) * step(0.28, fract(y)) * step(fract(y), 0.72) * step(1.0, row);
+        vec3 col = mix(vec3(0.80, 0.88, 1.0), vec3(0.22, 0.27, 0.40), ink) * mix(1.15, 0.75, uDay);
+        gl_FragColor = vec4(col, 1.0);
+      }`,
+  }), 0, 0.1075, -0.0045);
+  screen.rotation.y = Math.PI;
+  laptop.add(lid); striver.root.add(laptop);
+  laptop.updateMatrix(); handSpot.forEach(p => p.applyMatrix4(laptop.matrix));
+
+  // 身边的东西：背包、两本书、一个保温杯
+  part(bench, new THREE.CapsuleGeometry(0.13, 0.16, 4, 10), teal, -0.56, 0.7, 0.1, 1.2, 1, 0.75).rotation.x = 0.15;
+  part(bench, new THREE.SphereGeometry(0.1, 10, 8), lit(0x244d51), -0.56, 0.63, 0.0, 1.05, 0.8, 0.5);
+  part(bench, new THREE.TorusGeometry(0.04, 0.009, 5, 12, Math.PI), lit(0x244d51), -0.56, 0.9, 0.13).rotation.y = Math.PI / 2;   // 提手
+  part(bench, new THREE.BoxGeometry(0.22, 0.03, 0.16), lit(0xc8553d), 0.56, 0.505, 0.04).rotation.y = 0.2;
+  part(bench, new THREE.BoxGeometry(0.2, 0.025, 0.15), lit(0xe9e2d0), 0.56, 0.5325, 0.04).rotation.y = -0.12;
+  part(bench, new THREE.CylinderGeometry(0.036, 0.036, 0.2, 12), lit(0xb9bec4), 0.7, 0.59, -0.14);
+  part(bench, new THREE.CylinderGeometry(0.038, 0.038, 0.035, 12), lit(0x2a2c31), 0.7, 0.7075, -0.14);
+
+  striver.root.position.set(0.05, 0, -0.08); striver.root.rotation.y = Math.PI;   // 面朝大海
+  bench.add(striver.root);
+  bench.updateMatrixWorld(true);
+  screen.localToWorld(v3.set(0, 0, 0.06)); U.uScreen.value.set(v3.x, v3.y, v3.z, 0);
+}
+// 两节手臂的反解：给出手的落点（身体坐标），算出上臂和前臂的朝向，手肘朝外后方
+const DOWN = new THREE.Vector3(0, -1, 0), ikD = new THREE.Vector3(), ikE = new THREE.Vector3(), ikP = new THREE.Vector3();
+const ikQ = new THREE.Quaternion(), ikM = new THREE.Matrix4();
+function reach(A, sd, hand) {
+  const a = 0.28, b = 0.29;
+  ikD.copy(hand).sub(v4.set(sd * 0.215, 1.43, 0));
+  const L = Math.min(ikD.length(), a + b - 0.005), k = (a * a - b * b + L * L) / (2 * L);
+  ikD.normalize();
+  ikP.set(sd * 0.8, 0, -1); ikP.addScaledVector(ikD, -ikP.dot(ikD)).normalize();
+  ikE.copy(ikD).multiplyScalar(k).addScaledVector(ikP, Math.sqrt(Math.max(a * a - k * k, 0)));   // 肩 → 肘
+  A.up.quaternion.setFromUnitVectors(DOWN, v4.copy(ikE).normalize());
+  ikD.multiplyScalar(L).sub(ikE).normalize().applyQuaternion(ikQ.copy(A.up.quaternion).invert());   // 肘 → 手
+  A.fore.quaternion.setFromUnitVectors(DOWN, ikD);
+}
+function updateStriver(dt, t) {
+  const P = striver, cyc = t % 36;
+  const rest = smooth(27, 28.5, cyc) * (1 - smooth(33, 35, cyc));                              // 每隔半分钟抬头看一会儿海，再低头继续
+  const act = (1 - rest) * smooth(-0.9, -0.6, Math.sin(t * 0.8) + Math.sin(t * 0.31 + 2));     // 一阵一阵地敲，中间停下来想一想
+  typed.value += dt * 0.3 * act;
+  const lean = 0.3 - 0.2 * rest + 0.012 * Math.sin(t * 1.1);                                   // 埋头时前倾，带一点呼吸的起伏
+  P.body.rotation.x = lean;
+  P.body.position.set(0, HIP_Y - 0.93 * Math.cos(lean), -0.93 * Math.sin(lean));               // 绕着髋转，坐在原处不动
+  P.head.rotation.set(0.62 - 0.72 * rest + 0.03 * Math.sin(t * 0.47), 0.07 * Math.sin(t * 0.9) * act + 0.12 * rest, 0);
+  P.legs.forEach((L, i) => { L.thigh.rotation.x = -SIT - lean; L.shin.rotation.x = SIT + (i ? 0.3 : -0.08); });   // 一只脚收在椅子下面
+  P.body.updateMatrix(); ikM.copy(P.body.matrix).invert();
+  P.arms.forEach((A, i) => {
+    v3.copy(handSpot[i]);
+    v3.y += act * (0.012 + 0.012 * Math.sin(t * 19 + i * 2.4)); v3.x += act * 0.02 * Math.sin(t * 2.3 + i * 1.9);   // 敲键盘
+    reach(A, i ? 1 : -1, v3.applyMatrix4(ikM));
+  });
+  U.uScreen.value.w = 0.5 * smooth(0.5, 1, tod) + 2.6 * U.uMix.value;                          // 天越暗，屏幕的光越显眼
 }
 
 /* ---------- 城里人行道上的行人 ---------- */
@@ -1049,7 +1146,7 @@ const look = { yaw: 0, pitch: 0, tYaw: 0, tPitch: 0, fov: 55, tFov: 55 };
 const freePos = new THREE.Vector3(0, 2.3, 17), freeTarget = freePos.clone();
 let freeLook = { yaw: 0, pitch: 0 }, lastInput = -1e9;
 const clampFree = p => {
-  p.x = clamp(p.x, -70, 70); p.z = clamp(p.z, -60, 36);
+  p.x = clamp(p.x, -70, 70); p.z = clamp(p.z, -60, 44);
   p.y = clamp(p.y, Math.max(beachH(p.x, p.z), 0.08) + 1.3, 40);
 };
 function zoomBy(d) {
@@ -1160,6 +1257,7 @@ function frame() {
   updateWalkers(dt, t, true);
   updateCars(dt);
   updateCity(dt, t);
+  updateStriver(dt, t);
   boat.position.x += dt * 0.55; if (boat.position.x > 150) boat.position.x = -150;      // 帆船慢慢横过海面
   boat.position.y = 0.05 * Math.sin(t * 0.8); boat.rotation.z = 0.035 * Math.sin(t * 0.6);
 
